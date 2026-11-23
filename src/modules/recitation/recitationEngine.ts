@@ -8,6 +8,7 @@ export async function verifyRecitationAudio(params: {
   previousWord?: string;
   surahNameUz: string;
   ayahNumber: number;
+  transcriptHint?: string;
 }): Promise<VerificationResult> {
   const payload = {
     audioBase64: params.audioBase64,
@@ -15,6 +16,7 @@ export async function verifyRecitationAudio(params: {
     previousWord: params.previousWord ?? '',
     surahName: params.surahNameUz,
     ayahNumber: params.ayahNumber,
+    transcriptHint: params.transcriptHint,
     expectedWords: params.expectedWords.map((w) => ({
       arabic: w.displayArabic,
       plain: w.plainArabic,

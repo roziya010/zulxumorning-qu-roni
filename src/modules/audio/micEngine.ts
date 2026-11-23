@@ -1,11 +1,12 @@
 import { QuranWord, VerificationResult } from '../../types/quran';
-import { stripArabicDiacritics } from '../tajweed/tajweedParser';
+import { evaluateArabicTranscriptWords, stripArabicText } from '../recitation/arabicMatcher';
 
 export interface MicEngineCallbacks {
   onVolume: (rms: number) => void;
   onSpeechState: (isSpeaking: boolean) => void;
   onAudioSegment: (base64Wav: string, mimeType: string, latestTranscript?: string) => void;
-  onLiveTranscript?: (transcript: string, isFinal: boolean) => void;
+  onLiveTokens?: (tokens: string[], markConsumed: (count: number) => void) => void;
+  onEngineChange?: (mode: 'speech-live' | 'gemini-audio') => void;
   onError: (messageUz: string) => void;
 }
 
@@ -70,47 +71,97 @@ function encodeWavBase64(samples16k: Float32Array): string {
   return btoa(binary);
 }
 
+interface BrowserSpeechRec {
+  lang: string;
+  continuous: boolean;
+  interimResults: boolean;
+  maxAlternatives?: number;
+  onresult:
+    | ((ev: {
+        resultIndex?: number;
+        results: ArrayLike<{ isFinal?: boolean } & ArrayLike<{ transcript: string }>>;
+      }) => void)
+    | null;
+  onerror: ((ev: { error?: string }) => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+}
+
 export class RecitationMicEngine {
   private stream: MediaStream | null = null;
   private audioCtx: AudioContext | null = null;
   private processor: ScriptProcessorNode | null = null;
   private source: MediaStreamAudioSourceNode | null = null;
+  private silentGain: GainNode | null = null;
   private callbacks: MicEngineCallbacks;
   private isRunning = false;
 
-  // Adaptive VAD & buffering state
+  // Real PCM VAD & recording state
   private preRollChunks: Float32Array[] = [];
   private activeChunks: Float32Array[] = [];
   private isSpeaking = false;
   private speechStartMs = 0;
   private silenceStartMs = 0;
   private peakRms = 0;
-  private baseThreshold = 0.0045;
-  private noiseFloor = 0.0015;
+  private baseThreshold = 0.004;
+  private noiseFloor = 0.0012;
   private calibrationFrames = 0;
 
-  // Parallel browser SpeechRecognition
-  private recognition: unknown = null;
+  // Parallel Web Speech API state (runs alongside PCM capture when supported)
+  private recognition: BrowserSpeechRec | null = null;
+  private consumedPerResult = new Map<number, number>();
+  private interimDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private speechHandledAtMs = 0;
   private latestTranscript = '';
-  private lastTranscriptCursor = 0;
 
   constructor(callbacks: MicEngineCallbacks) {
     this.callbacks = callbacks;
   }
 
   setSensitivity(level: 'yuqori' | 'ortacha' | 'past'): void {
-    if (level === 'yuqori') this.baseThreshold = 0.0022;
-    else if (level === 'past') this.baseThreshold = 0.011;
-    else this.baseThreshold = 0.0045;
+    if (level === 'yuqori') this.baseThreshold = 0.002;
+    else if (level === 'past') this.baseThreshold = 0.01;
+    else this.baseThreshold = 0.004;
   }
 
   private getEffectiveThreshold(): number {
-    return Math.min(0.032, Math.max(this.baseThreshold, this.noiseFloor * 2.15));
+    return Math.min(0.03, Math.max(this.baseThreshold, this.noiseFloor * 2.1));
   }
 
-  async start(enableSpeechRecognitionBackup: boolean): Promise<boolean> {
+  async start(enableParallelSpeech = true): Promise<boolean> {
     if (this.isRunning) return true;
 
+    // 1. ALWAYS start real hardware getUserMedia PCM recording first!
+    // This guarantees browser permission prompt, live audio bars, and reliable WAV recording.
+    const pcmStarted = await this.startPcmCapture();
+    if (!pcmStarted) {
+      return false;
+    }
+
+    this.isRunning = true;
+    this.speechHandledAtMs = 0;
+    this.latestTranscript = '';
+    this.consumedPerResult.clear();
+    this.callbacks.onEngineChange?.('gemini-audio');
+
+    // 2. Also start parallel Web Speech API (ar-SA) when online & supported.
+    // If it emits tokens, we evaluate immediately with zero Gemini quota;
+    // if blocked/unsupported/silently empty, real WAV audio still flows to Gemini.
+    if (enableParallelSpeech && navigator.onLine) {
+      const SpeechRec =
+        (window as unknown as { SpeechRecognition?: new () => BrowserSpeechRec }).SpeechRecognition ||
+        (window as unknown as { webkitSpeechRecognition?: new () => BrowserSpeechRec }).webkitSpeechRecognition;
+
+      if (SpeechRec) {
+        this.startBrowserSpeechRecognition(SpeechRec);
+      }
+    }
+
+    return true;
+  }
+
+  private async startPcmCapture(): Promise<boolean> {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       this.callbacks.onError('Qurilmangiz brauzeri mikrofon yozuvini qo‘llab-quvvatlamaydi.');
       return false;
@@ -126,31 +177,31 @@ export class RecitationMicEngine {
         },
       });
 
-      const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      const AudioCtx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       this.audioCtx = new AudioCtx();
-      if (this.audioCtx.state === 'suspended') {
-        await this.audioCtx.resume();
-      }
 
       this.source = this.audioCtx.createMediaStreamSource(this.stream);
       this.processor = this.audioCtx.createScriptProcessor(2048, 1, 1);
 
-      const silentGain = this.audioCtx.createGain();
-      silentGain.gain.value = 0;
+      this.silentGain = this.audioCtx.createGain();
+      this.silentGain.gain.value = 0;
 
       this.source.connect(this.processor);
-      this.processor.connect(silentGain);
-      silentGain.connect(this.audioCtx.destination);
+      this.processor.connect(this.silentGain);
+      this.silentGain.connect(this.audioCtx.destination);
 
-      this.isRunning = true;
+      if (this.audioCtx.state === 'suspended') {
+        await this.audioCtx.resume();
+      }
+
       this.preRollChunks = [];
       this.activeChunks = [];
       this.isSpeaking = false;
       this.peakRms = 0;
-      this.noiseFloor = 0.0015;
+      this.noiseFloor = 0.0012;
       this.calibrationFrames = 0;
-      this.latestTranscript = '';
-      this.lastTranscriptCursor = 0;
 
       this.processor.onaudioprocess = (event: AudioProcessingEvent) => {
         if (!this.isRunning || !this.audioCtx) return;
@@ -164,7 +215,7 @@ export class RecitationMicEngine {
         const rms = Math.sqrt(sumSq / downsampled.length);
 
         if (!this.isSpeaking) {
-          if (this.calibrationFrames < 10) {
+          if (this.calibrationFrames < 8) {
             this.noiseFloor =
               this.calibrationFrames === 0
                 ? rms
@@ -176,7 +227,7 @@ export class RecitationMicEngine {
         }
 
         const threshold = this.getEffectiveThreshold();
-        this.callbacks.onVolume(Math.min(1, rms * 18));
+        this.callbacks.onVolume(Math.min(1, rms * 20));
 
         const now = performance.now();
 
@@ -210,21 +261,17 @@ export class RecitationMicEngine {
           const speechElapsed = now - this.speechStartMs;
           const silenceElapsed = this.silenceStartMs > 0 ? now - this.silenceStartMs : 0;
 
-          if ((silenceElapsed >= 460 && speechElapsed >= 240) || speechElapsed >= 2200) {
+          if ((silenceElapsed >= 440 && speechElapsed >= 240) || speechElapsed >= 2600) {
             this.emitCurrentSegment();
           }
         }
       };
 
-      if (enableSpeechRecognitionBackup) {
-        this.startBrowserSpeechRecognition();
-      }
-
       return true;
     } catch (err) {
       const msg =
         err instanceof DOMException && err.name === 'NotAllowedError'
-          ? 'Mikrofonga ruxsat berilmadi. Telefon yoki brauzer sozlamalaridan mikrofon ruxsatini yoqing.'
+          ? 'Mikrofonga ruxsat berilmadi. Brauzer yoki telefon sozlamalaridan mikrofon ruxsatini yoqing.'
           : 'Mikrofonni ishga tushirib bo‘lmadi. Qurilma mikrofonini tekshiring.';
       this.callbacks.onError(msg);
       this.stop();
@@ -241,8 +288,9 @@ export class RecitationMicEngine {
 
     const totalLen = this.activeChunks.reduce((acc, c) => acc + c.length, 0);
     const durationMs = (totalLen / TARGET_SAMPLE_RATE) * 1000;
+    const handledByLiveSpeech = performance.now() - this.speechHandledAtMs < 2000;
 
-    if (durationMs >= 240 && this.peakRms > this.baseThreshold * 0.75) {
+    if (durationMs >= 220 && this.peakRms > this.baseThreshold * 0.7 && !handledByLiveSpeech) {
       const merged = new Float32Array(totalLen);
       let offset = 0;
       for (const chunk of this.activeChunks) {
@@ -250,9 +298,9 @@ export class RecitationMicEngine {
         offset += chunk.length;
       }
       const base64Wav = encodeWavBase64(merged);
-      const transcriptHint = this.latestTranscript;
+      const hint = this.latestTranscript;
       this.latestTranscript = '';
-      this.callbacks.onAudioSegment(base64Wav, 'audio/wav', transcriptHint || undefined);
+      this.callbacks.onAudioSegment(base64Wav, 'audio/wav', hint || undefined);
     }
 
     this.activeChunks = [];
@@ -262,54 +310,88 @@ export class RecitationMicEngine {
     this.callbacks.onSpeechState(false);
   }
 
-  private startBrowserSpeechRecognition(): void {
-    const SpeechRec =
-      (window as unknown as { SpeechRecognition?: new () => unknown }).SpeechRecognition ||
-      (window as unknown as { webkitSpeechRecognition?: new () => unknown }).webkitSpeechRecognition;
-
-    if (!SpeechRec) return;
+  private startBrowserSpeechRecognition(SpeechRec: new () => BrowserSpeechRec): void {
     try {
-      const rec = new SpeechRec() as {
-        lang: string;
-        continuous: boolean;
-        interimResults: boolean;
-        onresult: ((ev: { resultIndex?: number; results: ArrayLike<{ isFinal?: boolean } & ArrayLike<{ transcript: string }>> }) => void) | null;
-        onerror: ((ev: { error?: string }) => void) | null;
-        onend: (() => void) | null;
-        start: () => void;
-        stop: () => void;
-      };
+      const rec = new SpeechRec();
       rec.lang = 'ar-SA';
       rec.continuous = true;
       rec.interimResults = true;
-      this.lastTranscriptCursor = 0;
+      rec.maxAlternatives = 1;
+      this.consumedPerResult.clear();
+
+      const flushResultTokens = (
+        results: ArrayLike<{ isFinal?: boolean } & ArrayLike<{ transcript: string }>>,
+        startIdx: number,
+        isFinalOnly: boolean
+      ) => {
+        for (let i = startIdx; i < results.length; i++) {
+          const item = results[i];
+          if (isFinalOnly && !item.isFinal) continue;
+          const rawTranscript = item[0]?.transcript?.trim() ?? '';
+          if (!rawTranscript) continue;
+
+          this.latestTranscript = rawTranscript;
+
+          const allTokens = rawTranscript
+            .split(/\s+/)
+            .map((t) => stripArabicText(t))
+            .filter(Boolean);
+
+          const alreadyConsumed = this.consumedPerResult.get(i) ?? 0;
+          if (allTokens.length <= alreadyConsumed) continue;
+
+          const pending = allTokens.slice(alreadyConsumed);
+          this.speechHandledAtMs = performance.now();
+          this.callbacks.onEngineChange?.('speech-live');
+          this.callbacks.onLiveTokens?.(pending, (consumedCount) => {
+            this.consumedPerResult.set(i, alreadyConsumed + Math.max(0, consumedCount));
+          });
+        }
+      };
+
       rec.onresult = (ev) => {
-        const startIdx = Math.max(this.lastTranscriptCursor, ev.resultIndex ?? 0);
-        const parts: string[] = [];
-        let sawFinal = false;
-        for (let i = startIdx; i < ev.results.length; i++) {
-          const item = ev.results[i];
-          const txt = item[0]?.transcript?.trim();
-          if (txt) parts.push(txt);
-          if (item.isFinal) {
-            this.lastTranscriptCursor = i + 1;
-            sawFinal = true;
-          }
+        if (!this.isRunning) return;
+        const startIdx = ev.resultIndex ?? 0;
+
+        if (this.interimDebounceTimer) {
+          clearTimeout(this.interimDebounceTimer);
+          this.interimDebounceTimer = null;
         }
-        const combined = parts.join(' ').trim();
-        if (combined) {
-          this.latestTranscript = combined;
-          this.callbacks.onLiveTranscript?.(combined, sawFinal);
+
+        flushResultTokens(ev.results, startIdx, true);
+
+        const hasPendingInterim = Array.from({ length: ev.results.length - startIdx }, (_, k) => startIdx + k).some(
+          (idx) => !ev.results[idx]?.isFinal
+        );
+
+        if (hasPendingInterim) {
+          this.interimDebounceTimer = setTimeout(() => {
+            if (!this.isRunning) return;
+            flushResultTokens(ev.results, startIdx, false);
+          }, 420);
         }
       };
+
       rec.onerror = (ev) => {
-        if (ev?.error === 'not-allowed' || ev?.error === 'service-not-allowed') {
-          this.recognition = null;
+        const errCode = ev?.error ?? '';
+        if (errCode === 'no-speech' || errCode === 'aborted') return;
+        // If browser speech recognition cannot share hardware mic or is unavailable,
+        // stop SpeechRecognition quietly and let getUserMedia PCM recording continue untouched!
+        if (
+          errCode === 'not-allowed' ||
+          errCode === 'service-not-allowed' ||
+          errCode === 'audio-capture' ||
+          errCode === 'network' ||
+          errCode === 'language-not-supported'
+        ) {
+          this.stopRecognitionOnly();
+          this.callbacks.onEngineChange?.('gemini-audio');
         }
       };
+
       rec.onend = () => {
         if (this.isRunning && this.recognition === rec) {
-          this.lastTranscriptCursor = 0;
+          this.consumedPerResult.clear();
           try {
             rec.start();
           } catch {
@@ -317,17 +399,31 @@ export class RecitationMicEngine {
           }
         }
       };
+
       rec.start();
       this.recognition = rec;
     } catch {
-      // Browser SpeechRecognition unavailable
+      // SpeechRecognition unavailable; PCM capture remains active
     }
   }
 
-  consumePendingTranscript(): string {
-    const t = this.latestTranscript;
-    this.latestTranscript = '';
-    return t;
+  private stopRecognitionOnly(): void {
+    if (this.interimDebounceTimer) {
+      clearTimeout(this.interimDebounceTimer);
+      this.interimDebounceTimer = null;
+    }
+    if (this.recognition) {
+      const rec = this.recognition;
+      rec.onend = null;
+      rec.onerror = null;
+      rec.onresult = null;
+      this.recognition = null;
+      try {
+        rec.stop();
+      } catch {
+        // ignore
+      }
+    }
   }
 
   stop(): void {
@@ -338,16 +434,7 @@ export class RecitationMicEngine {
     this.callbacks.onVolume(0);
     this.callbacks.onSpeechState(false);
 
-    if (this.recognition) {
-      const rec = this.recognition as { onend: (() => void) | null; stop: () => void };
-      rec.onend = null;
-      this.recognition = null;
-      try {
-        rec.stop();
-      } catch {
-        // ignore
-      }
-    }
+    this.stopRecognitionOnly();
 
     if (this.processor) {
       try {
@@ -357,6 +444,15 @@ export class RecitationMicEngine {
       }
       this.processor.onaudioprocess = null;
       this.processor = null;
+    }
+
+    if (this.silentGain) {
+      try {
+        this.silentGain.disconnect();
+      } catch {
+        // ignore
+      }
+      this.silentGain = null;
     }
 
     if (this.source) {
@@ -380,92 +476,6 @@ export class RecitationMicEngine {
   }
 }
 
-const CONFUSED_LETTER_PAIRS: Array<[string, string]> = [
-  ['س', 'ص'],
-  ['ت', 'ط'],
-  ['د', 'ض'],
-  ['ذ', 'ز'],
-  ['ح', 'ه'],
-  ['ع', 'ا'],
-  ['ق', 'ك'],
-  ['ث', 'س'],
-];
-
-function expandUthmaniForSpeech(displayArabic: string): string {
-  const withDaggerAlif = displayArabic
-    .replace(/\u0640\u0670/g, 'ا')
-    .replace(/[\u066E\u0649]\u0670/g, 'ا')
-    .replace(/\u0670/g, 'ا');
-  return stripArabicDiacritics(withDaggerAlif);
-}
-
-function countChar(str: string, ch: string): number {
-  let count = 0;
-  for (let i = 0; i < str.length; i++) {
-    if (str[i] === ch) count += 1;
-  }
-  return count;
-}
-
-function findConfusedPair(target: string, spoken: string): string | null {
-  for (const [a, b] of CONFUSED_LETTER_PAIRS) {
-    const tA = countChar(target, a);
-    const sA = countChar(spoken, a);
-    const tB = countChar(target, b);
-    const sB = countChar(spoken, b);
-    if ((tA > sA && sB > tB) || (tB > sB && sA > tA)) {
-      return `${a} ↔ ${b}`;
-    }
-  }
-  return null;
-}
-
-function levenshtein(a: string, b: string): number {
-  const m = a.length;
-  const n = b.length;
-  const dp: number[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
-  for (let i = 0; i <= m; i++) dp[i][0] = i;
-  for (let j = 0; j <= n; j++) dp[0][j] = j;
-  for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      dp[i][j] = Math.min(
-        dp[i - 1][j] + 1,
-        dp[i][j - 1] + 1,
-        dp[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)
-      );
-    }
-  }
-  return dp[m][n];
-}
-
-function isArabicWordMatch(expected: QuranWord, spokenPlain: string): {
-  matched: boolean;
-  confusedPair: string | null;
-} {
-  const formA = expected.plainArabic;
-  const formB = expandUthmaniForSpeech(expected.displayArabic);
-  if (spokenPlain === formA || spokenPlain === formB) {
-    return { matched: true, confusedPair: null };
-  }
-
-  const confused = findConfusedPair(formA, spokenPlain);
-  if (confused) {
-    return { matched: false, confusedPair: confused };
-  }
-
-  const distA = levenshtein(formA, spokenPlain);
-  const distB = levenshtein(formB, spokenPlain);
-  const bestDist = Math.min(distA, distB);
-  const minLen = Math.min(formA.length, formB.length);
-
-  // Strict threshold: 0 edits for <=4 chars, max 1 edit for >=5 chars
-  if (minLen >= 5 && bestDist <= 1) {
-    return { matched: true, confusedPair: null };
-  }
-
-  return { matched: false, confusedPair: null };
-}
-
 /**
  * Evaluates Arabic transcript strictly word-by-word against expected Quran words.
  */
@@ -473,54 +483,5 @@ export function evaluateOfflineArabicTranscript(
   transcript: string,
   expectedWords: QuranWord[]
 ): VerificationResult {
-  const spokenTokens = transcript
-    .split(/\s+/)
-    .map((t) => stripArabicDiacritics(t))
-    .filter(Boolean);
-
-  if (spokenTokens.length === 0) {
-    return {
-      status: 'unclear',
-      matchedCount: 0,
-      heardArabic: '',
-      errorWordIndex: -1,
-      errorCategory: 'none',
-      feedbackUz: 'Ovozni aniq tekshira olmadim, qayta o‘qing.',
-      engine: 'offline-speech',
-    };
-  }
-
-  let matchedCount = 0;
-  for (let i = 0; i < Math.min(spokenTokens.length, expectedWords.length); i++) {
-    const check = isArabicWordMatch(expectedWords[i], spokenTokens[i]);
-    if (check.matched) {
-      matchedCount += 1;
-    } else {
-      return {
-        status: 'error',
-        matchedCount,
-        heardArabic: transcript,
-        errorWordIndex: i,
-        errorCategory: 'harf',
-        confusedLetters: check.confusedPair ?? undefined,
-        feedbackUz: check.confusedPair
-          ? `«${expectedWords[i].displayArabic}» so‘zida ${check.confusedPair} harfi adashib ketdi. Qayta aniq o‘qing.`
-          : `«${expectedWords[i].displayArabic}» so‘zida xato aniqlandi. Qizil so‘zni qayta to‘g‘ri o‘qing.`,
-        engine: 'offline-speech',
-      };
-    }
-  }
-
-  return {
-    status: matchedCount > 0 ? 'matched' : 'unclear',
-    matchedCount,
-    heardArabic: transcript,
-    errorWordIndex: -1,
-    errorCategory: 'none',
-    feedbackUz:
-      matchedCount > 0
-        ? 'To‘g‘ri o‘qildi.'
-        : 'Ovozni aniq tekshira olmadim, qayta o‘qing.',
-    engine: 'offline-speech',
-  };
+  return evaluateArabicTranscriptWords(transcript, expectedWords, 'offline-speech');
 }

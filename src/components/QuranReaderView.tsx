@@ -100,6 +100,7 @@ export const QuranReaderView: React.FC<QuranReaderViewProps> = ({
   const [micVolume, setMicVolume] = useState(0);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [micErrorMsg, setMicErrorMsg] = useState<string | null>(null);
+  const [activeEngineMode, setActiveEngineMode] = useState<'speech-live' | 'gemini-audio' | null>(null);
   const [showLegend, setShowLegend] = useState(false);
 
   // Page completion modal state
@@ -355,17 +356,24 @@ export const QuranReaderView: React.FC<QuranReaderViewProps> = ({
 
         const expectedSlice = allWords.slice(startIdx, startIdx + 5);
 
-        // If offline or Gemini is currently in rate-limit cooldown, use live SpeechRecognition if captured
-        if (!navigator.onLine || Date.now() < geminiCooldownUntilRef.current) {
+        if (!navigator.onLine) {
           if (latestTranscript) {
             const localRes = evaluateOfflineArabicTranscript(latestTranscript, expectedSlice);
             await applyVerificationResult(localRes, startIdx);
             return;
           }
-          if (!navigator.onLine) {
-            setMicStatus('unclear');
-            setMicErrorMsg('Oflayn rejimdasiz. Chuqur AI tajvid tekshiruvi uchun internet kerak.');
+          setMicStatus('unclear');
+          setMicErrorMsg('Oflayn rejimdasiz. Ovozli tekshiruv uchun internet aloqasi kerak.');
+          return;
+        }
+
+        if (Date.now() < geminiCooldownUntilRef.current) {
+          if (latestTranscript) {
+            const localRes = evaluateOfflineArabicTranscript(latestTranscript, expectedSlice);
+            await applyVerificationResult(localRes, startIdx);
+            return;
           }
+          setMicStatus('listening');
           return;
         }
 
@@ -383,10 +391,11 @@ export const QuranReaderView: React.FC<QuranReaderViewProps> = ({
             previousWord: prevWord,
             surahNameUz: surahMeta.nameUz,
             ayahNumber: expectedSlice[0].ayahNumber,
+            transcriptHint: latestTranscript,
           });
           await applyVerificationResult(res, startIdx);
         } catch (err) {
-          geminiCooldownUntilRef.current = Date.now() + 14000;
+          geminiCooldownUntilRef.current = Date.now() + 4500;
           if (latestTranscript) {
             const fallbackRes = evaluateOfflineArabicTranscript(latestTranscript, expectedSlice);
             await applyVerificationResult(fallbackRes, startIdx);
@@ -404,19 +413,26 @@ export const QuranReaderView: React.FC<QuranReaderViewProps> = ({
     [applyVerificationResult]
   );
 
-  const handleLiveTranscript = useCallback(
-    (transcript: string, isFinal: boolean) => {
-      // Only run immediate transcript evaluation when offline or during Gemini 429/503 cooldown
-      if (navigator.onLine && Date.now() >= geminiCooldownUntilRef.current) return;
-      if (!isFinal) return;
+  const handleLiveTokens = useCallback(
+    (tokens: string[], markConsumed: (count: number) => void) => {
+      if (tokens.length === 0) return;
       queuePromiseRef.current = queuePromiseRef.current.then(async () => {
+        if (!isMountedRef.current) return;
         const allWords = wordsRef.current;
         const startIdx = cursorRef.current;
         if (startIdx >= allWords.length) return;
-        const consumed = micEngineRef.current?.consumePendingTranscript() || transcript;
-        if (!consumed) return;
-        const expectedSlice = allWords.slice(startIdx, startIdx + 5);
-        const res = evaluateOfflineArabicTranscript(consumed, expectedSlice);
+
+        const expectedSlice = allWords.slice(startIdx, startIdx + tokens.length + 2);
+        const res = evaluateOfflineArabicTranscript(tokens.join(' '), expectedSlice);
+
+        if (res.status === 'matched') {
+          markConsumed(Math.max(1, res.matchedCount));
+        } else if (res.status === 'error') {
+          // Consume entire error-halted utterance so trailing tokens from the same breath
+          // are not misapplied to the retry word after stopping.
+          markConsumed(tokens.length);
+        }
+
         await applyVerificationResult(res, startIdx);
       });
     },
@@ -429,6 +445,7 @@ export const QuranReaderView: React.FC<QuranReaderViewProps> = ({
       setIsMicOn(false);
       setIsSpeaking(false);
       setMicVolume(0);
+      setActiveEngineMode(null);
       setMicStatus('stopped');
       return;
     }
@@ -438,10 +455,12 @@ export const QuranReaderView: React.FC<QuranReaderViewProps> = ({
       onVolume: (rms) => setMicVolume(rms),
       onSpeechState: (speaking) => setIsSpeaking(speaking),
       onAudioSegment: (b64, mime, transcript) => enqueueAudioVerification(b64, mime, transcript),
-      onLiveTranscript: handleLiveTranscript,
+      onLiveTokens: handleLiveTokens,
+      onEngineChange: (mode) => setActiveEngineMode(mode),
       onError: (msg) => {
         setMicErrorMsg(msg);
         setIsMicOn(false);
+        setActiveEngineMode(null);
         setMicStatus('stopped');
       },
     });
@@ -838,6 +857,9 @@ export const QuranReaderView: React.FC<QuranReaderViewProps> = ({
                 }`}
               >
                 {MIC_STATUS_LABELS[micStatus]}
+                {isMicOn && activeEngineMode === 'speech-live' && (
+                  <span className="ml-1.5 text-[11px] font-medium text-[#15803d]">· Limitsiz jonli</span>
+                )}
               </p>
             </div>
             <p className="mt-0.5 text-xs text-[#5c564d] truncate">
@@ -855,9 +877,9 @@ export const QuranReaderView: React.FC<QuranReaderViewProps> = ({
             </p>
           </div>
 
-          {/* Live Audio Level Bars when Mic Active */}
+          {/* Live Audio Level Bars when Mic Active (visible on both mobile & desktop) */}
           {isMicOn && (
-            <div className="hidden items-end gap-1 h-7 sm:flex" aria-hidden="true">
+            <div className="flex items-end gap-1 h-7 shrink-0" aria-hidden="true">
               {[0.35, 0.7, 1, 0.75, 0.4].map((scale, i) => (
                 <span
                   key={i}

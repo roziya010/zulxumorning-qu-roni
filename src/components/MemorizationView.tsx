@@ -241,15 +241,22 @@ export const MemorizationView: React.FC<MemorizationViewProps> = ({
 
         const expectedSlice = allWords.slice(startIdx, startIdx + 5);
 
-        if (!navigator.onLine || Date.now() < geminiCooldownUntilRef.current) {
+        if (!navigator.onLine) {
           if (latestTranscript) {
             await processHifzResult(evaluateOfflineArabicTranscript(latestTranscript, expectedSlice), startIdx);
             return;
           }
-          if (!navigator.onLine) {
-            setMicStatus('unclear');
-            setFeedbackUz('Yodlashni AI orqali tekshirish uchun internet aloqasi kerak.');
+          setMicStatus('unclear');
+          setFeedbackUz('Yodlashni ovozli tekshirish uchun internet aloqasi kerak.');
+          return;
+        }
+
+        if (Date.now() < geminiCooldownUntilRef.current) {
+          if (latestTranscript) {
+            await processHifzResult(evaluateOfflineArabicTranscript(latestTranscript, expectedSlice), startIdx);
+            return;
           }
+          setMicStatus('listening');
           return;
         }
 
@@ -265,10 +272,11 @@ export const MemorizationView: React.FC<MemorizationViewProps> = ({
             previousWord: prevWord,
             surahNameUz: surahMeta.nameUz,
             ayahNumber: expectedSlice[0].ayahNumber,
+            transcriptHint: latestTranscript,
           });
           await processHifzResult(result, startIdx);
         } catch (err) {
-          geminiCooldownUntilRef.current = Date.now() + 14000;
+          geminiCooldownUntilRef.current = Date.now() + 4500;
           if (latestTranscript) {
             await processHifzResult(evaluateOfflineArabicTranscript(latestTranscript, expectedSlice), startIdx);
             return;
@@ -281,18 +289,25 @@ export const MemorizationView: React.FC<MemorizationViewProps> = ({
     [processHifzResult, selectedSurah]
   );
 
-  const handleLiveTranscript = useCallback(
-    (transcript: string, isFinal: boolean) => {
-      if (navigator.onLine && Date.now() >= geminiCooldownUntilRef.current) return;
-      if (!isFinal) return;
+  const handleLiveTokens = useCallback(
+    (tokens: string[], markConsumed: (count: number) => void) => {
+      if (tokens.length === 0) return;
       queuePromiseRef.current = queuePromiseRef.current.then(async () => {
+        if (!isMountedRef.current) return;
         const allWords = wordsRef.current;
         const startIdx = cursorRef.current;
         if (startIdx >= allWords.length) return;
-        const consumed = micEngineRef.current?.consumePendingTranscript() || transcript;
-        if (!consumed) return;
-        const expectedSlice = allWords.slice(startIdx, startIdx + 5);
-        await processHifzResult(evaluateOfflineArabicTranscript(consumed, expectedSlice), startIdx);
+
+        const expectedSlice = allWords.slice(startIdx, startIdx + tokens.length + 2);
+        const res = evaluateOfflineArabicTranscript(tokens.join(' '), expectedSlice);
+
+        if (res.status === 'matched') {
+          markConsumed(Math.max(1, res.matchedCount));
+        } else if (res.status === 'error') {
+          markConsumed(tokens.length);
+        }
+
+        await processHifzResult(res, startIdx);
       });
     },
     [processHifzResult]
@@ -310,7 +325,7 @@ export const MemorizationView: React.FC<MemorizationViewProps> = ({
       onVolume: () => {},
       onSpeechState: () => {},
       onAudioSegment: (b64, mime, transcript) => enqueueVerification(b64, mime, transcript),
-      onLiveTranscript: handleLiveTranscript,
+      onLiveTokens: handleLiveTokens,
       onError: (msg) => {
         setFeedbackUz(msg);
         setIsMicOn(false);

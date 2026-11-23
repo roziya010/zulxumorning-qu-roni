@@ -5,6 +5,7 @@ import dotenv from 'dotenv';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
 import { fileURLToPath } from 'url';
+import { evaluateArabicTranscriptWords } from './src/modules/recitation/arabicMatcher.ts';
 
 dotenv.config();
 
@@ -189,85 +190,19 @@ function getAiClient(): GoogleGenAI | null {
   });
 }
 
-function stripDiacriticsServer(text: string): string {
-  return text
-    .replace(/[\u064B-\u065F\u0670\u06D6-\u06ED\u0640\u200C\u200D\uFEFF]/g, '')
-    .replace(/[أإآٱٲٳٵ]/g, 'ا')
-    .replace(/[ىٮ]/g, 'ي')
-    .replace(/ة/g, 'ه')
-    .replace(/[^\u0621-\u064A\s]/g, '')
-    .trim();
+const modelCooldownUntil = new Map<string, number>();
+
+function isModelOnCooldown(model: string): boolean {
+  const until = modelCooldownUntil.get(model) ?? 0;
+  return Date.now() < until;
 }
 
-function levenshteinServer(a: string, b: string): number {
-  const m = a.length;
-  const n = b.length;
-  const dp: number[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
-  for (let i = 0; i <= m; i++) dp[i][0] = i;
-  for (let j = 0; j <= n; j++) dp[0][j] = j;
-  for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      dp[i][j] = Math.min(
-        dp[i - 1][j] + 1,
-        dp[i][j - 1] + 1,
-        dp[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)
-      );
-    }
+function markModelCooldown(model: string, status?: number): void {
+  if (status === 429) {
+    modelCooldownUntil.set(model, Date.now() + 45_000);
+  } else if (status === 503) {
+    modelCooldownUntil.set(model, Date.now() + 15_000);
   }
-  return dp[m][n];
-}
-
-function compareTranscriptToExpected(
-  transcript: string,
-  expectedWords: Array<{ arabic: string; plain: string }>
-) {
-  const spokenTokens = transcript
-    .split(/\s+/)
-    .map((t) => stripDiacriticsServer(t))
-    .filter(Boolean);
-
-  if (spokenTokens.length === 0) {
-    return {
-      status: 'unclear' as const,
-      matchedCount: 0,
-      heardArabic: transcript,
-      errorWordIndex: -1,
-      errorCategory: 'none' as const,
-      confusedLetters: '',
-      feedbackUz: 'Ovozni aniq tekshira olmadim, qayta o‘qing.',
-    };
-  }
-
-  let matchedCount = 0;
-  for (let i = 0; i < Math.min(spokenTokens.length, expectedWords.length); i++) {
-    const target = stripDiacriticsServer(expectedWords[i].plain || expectedWords[i].arabic);
-    const spoken = spokenTokens[i];
-    const maxLen = Math.max(target.length, spoken.length, 1);
-    const dist = levenshteinServer(target, spoken);
-    if (dist / maxLen <= 0.36) {
-      matchedCount += 1;
-    } else {
-      return {
-        status: 'error' as const,
-        matchedCount,
-        heardArabic: transcript,
-        errorWordIndex: i,
-        errorCategory: 'harf' as const,
-        confusedLetters: '',
-        feedbackUz: `«${expectedWords[i].arabic}» so‘zida talaffuz xatosi aniqlandi. Iltimos, so‘zni qayta to‘g‘ri o‘qing.`,
-      };
-    }
-  }
-
-  return {
-    status: matchedCount > 0 ? ('matched' as const) : ('unclear' as const),
-    matchedCount,
-    heardArabic: transcript,
-    errorWordIndex: -1,
-    errorCategory: 'none' as const,
-    confusedLetters: '',
-    feedbackUz: matchedCount > 0 ? 'To‘g‘ri o‘qildi.' : 'Ovozni aniq tekshira olmadim, qayta o‘qing.',
-  };
 }
 
 async function startServer() {
@@ -386,13 +321,14 @@ async function startServer() {
 
   app.post('/api/recitation/verify', async (req, res) => {
     try {
-      const { audioBase64, mimeType, expectedWords, previousWord, surahName, ayahNumber } = req.body as {
+      const { audioBase64, mimeType, expectedWords, previousWord, surahName, ayahNumber, transcriptHint } = req.body as {
         audioBase64?: string;
         mimeType?: string;
         expectedWords?: Array<{ arabic: string; plain: string; rules?: string[] }>;
         previousWord?: string;
         surahName?: string;
         ayahNumber?: number;
+        transcriptHint?: string;
       };
 
       if (!audioBase64 || !Array.isArray(expectedWords) || expectedWords.length === 0) {
@@ -400,8 +336,17 @@ async function startServer() {
         return;
       }
 
+      const matcherExpected = expectedWords.map((w) => ({
+        displayArabic: w.arabic,
+        plainArabic: w.plain,
+      }));
+
       const ai = getAiClient();
       if (!ai) {
+        if (transcriptHint) {
+          res.json(evaluateArabicTranscriptWords(transcriptHint, matcherExpected, 'offline-speech'));
+          return;
+        }
         res.status(503).json({
           error: 'AI ovoz tekshiruvi kaliti sozlanmagan. Iltimos, AI Studio Secrets panelida GEMINI_API_KEY ni tekshiring.',
         });
@@ -478,9 +423,12 @@ Audio yozuvdagi arabcha tilovatni tahlil qil va JSON natija qaytar.`;
         },
       };
 
-      const modelCandidates: Array<{ model: string; thinkingLevel?: ThinkingLevel }> = [
-        { model: 'gemini-4-hydrogen', thinkingLevel: ThinkingLevel.LOW },
+      const modelCandidates: Array<{
+        model: string;
+        thinkingLevel?: ThinkingLevel;
+      }> = [
         { model: 'gemini-3.1-flash-lite' },
+        { model: 'gemini-3.1-flash-lite' }, // retry once if transient 503
         { model: 'gemini-4-hydrogen', thinkingLevel: ThinkingLevel.LOW },
       ];
 
@@ -489,10 +437,19 @@ Audio yozuvdagi arabcha tilovatni tahlil qil va JSON natija qaytar.`;
 
       for (let i = 0; i < modelCandidates.length; i++) {
         const candidate = modelCandidates[i];
+        if (isModelOnCooldown(candidate.model)) {
+          attemptErrors.push(`${candidate.model}:cooldown`);
+          continue;
+        }
+        // Only run the second gemini-3.1-flash-lite attempt if the first one failed with 503
+        if (i === 1 && lastErr?.status !== 503) {
+          continue;
+        }
+        if (i === 1) {
+          await new Promise((r) => setTimeout(r, 700));
+        }
+
         try {
-          if (i === 2) {
-            await new Promise((r) => setTimeout(r, 1200));
-          }
           const response = await ai.models.generateContent({
             model: candidate.model,
             contents: {
@@ -524,20 +481,29 @@ Audio yozuvdagi arabcha tilovatni tahlil qil va JSON natija qaytar.`;
           return;
         } catch (err: unknown) {
           const errObj = err as { status?: number; message?: string };
+          if (errObj?.status === 429) {
+            markModelCooldown(candidate.model, 429);
+          }
           if (errObj?.status !== 404 || !lastErr) {
             lastErr = errObj;
           }
           attemptErrors.push(`${candidate.model}:${errObj?.status ?? 'err'}`);
-          console.warn(`Model ${candidate.model} (attempt ${i + 1}) failed (${errObj?.status}):`, errObj?.message?.slice(0, 180));
+          console.warn(`Model ${candidate.model} failed (${errObj?.status}):`, errObj?.message?.slice(0, 180));
         }
+      }
+
+      if (transcriptHint && transcriptHint.trim()) {
+        res.json(evaluateArabicTranscriptWords(transcriptHint, matcherExpected, 'offline-speech'));
+        return;
       }
 
       const status = lastErr?.status && lastErr.status >= 400 && lastErr.status < 600 ? lastErr.status : 503;
       res.status(status).json({
         error:
           status === 429
-            ? 'AI so‘rovlar limiti vaqtincha to‘ldi. Bir necha soniyadan so‘ng davom eting.'
+            ? 'Gemini bepul tarifi daqiqalik limiti vaqtincha to‘ldi. Limitsiz o‘qish uchun jonli nutq aniqlash faol (yoki AI Studio Secrets orqali to‘lovli API kalit ulang).'
             : `AI ovoz tekshiruvi vaqtincha band (${attemptErrors.join(', ')}). Qayta urinib ko‘ring.`,
+        details: attemptErrors,
       });
     } catch (err: unknown) {
       const errorObj = err as { status?: number; message?: string };
