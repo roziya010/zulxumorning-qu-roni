@@ -1,0 +1,6 @@
+{
+  "name": "Zulxumor Qur'on",
+  "description": "Zulxumor uchun haqiqiy ovozli tekshiruv, tajvid ranglari, yodlash va takrorlash imkoniyatiga ega Qur'on ilovasi",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

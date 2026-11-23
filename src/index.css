@@ -1,0 +1,64 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --bg-cream: #fbf8f1;
+    --bg-beige: #f4eee1;
+    --surface-card: #ffffff;
+    --emerald-deep: #0b4f3a;
+    --emerald-rich: #11694d;
+    --gold-antique: #b8892b;
+    --gold-soft: #e9d9b4;
+    --ink-primary: #1a1815;
+    --ink-muted: #5c564d;
+    --hairline: rgba(11, 79, 58, 0.11);
+  }
+
+  html {
+    background-color: var(--bg-cream);
+    color: var(--ink-primary);
+    font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  body {
+    margin: 0;
+    background-color: var(--bg-cream);
+    color: var(--ink-primary);
+    overflow-x: hidden;
+  }
+}
+
+.font-display {
+  font-family: 'Fraunces', Georgia, serif;
+}
+
+.font-quran {
+  font-family: 'Amiri', 'Scheherazade New', serif;
+  font-feature-settings: "liga" 1, "calt" 1, "mark" 1, "mkmk" 1;
+  text-rendering: optimizeLegibility;
+}
+
+.mushaf-parchment {
+  background: linear-gradient(180deg, #fffdf7 0%, #fbf6e8 100%);
+  box-shadow:
+    0 1px 2px rgba(26, 24, 21, 0.04),
+    0 12px 32px -12px rgba(11, 79, 58, 0.08);
+}
+
+.mushaf-frame {
+  border: 1px solid rgba(184, 137, 43, 0.38);
+  box-shadow: inset 0 0 0 3px #fbf6e8, inset 0 0 0 4px rgba(11, 79, 58, 0.16);
+}
+
+.pb-safe {
+  padding-bottom: max(0.5rem, env(safe-area-inset-bottom));
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
